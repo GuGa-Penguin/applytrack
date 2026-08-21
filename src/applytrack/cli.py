@@ -7,6 +7,7 @@ import json
 import sys
 
 from . import repository as repo
+from .ai import AiNotConfiguredError, AiRequestError, assess_fit, parse_posting, to_application
 from .db import build_session_factory, create_db_engine, session_scope
 from .models import Stage
 from .schemas import ApplicationCreate
@@ -42,7 +43,26 @@ def _build_parser() -> argparse.ArgumentParser:
     move.add_argument("--note")
 
     sub.add_parser("stats", help="Show funnel statistics.")
+
+    parse = sub.add_parser("parse", help="Parse a job posting with Claude.")
+    parse.add_argument("posting_file", help="Path to a file containing the posting.")
+    parse.add_argument("--save", action="store_true", help="Also track the parsed role.")
+    parse.add_argument("--source")
+
+    score = sub.add_parser("score", help="Score an application against your profile.")
+    score.add_argument("application_id", type=int)
+    score.add_argument("--profile", required=True, help="Path to your profile file.")
+
     return parser
+
+
+def _read_file(path: str) -> str:
+    """Read a UTF-8 text file, surfacing a clear error when it is missing."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return handle.read()
+    except OSError as error:
+        raise OSError(f"could not read {path}: {error}") from error
 
 
 def _format_row(application) -> str:
@@ -98,7 +118,33 @@ def main(argv: list[str] | None = None) -> int:
             elif args.command == "stats":
                 print(json.dumps(repo.funnel_stats(session), indent=2))
 
-    except (repo.ApplicationNotFoundError, repo.InvalidStageTransition, ValueError) as error:
+            elif args.command == "parse":
+                posting = parse_posting(_read_file(args.posting_file))
+                print(posting.model_dump_json(indent=2))
+                if args.save:
+                    application = repo.create_application(
+                        session,
+                        to_application(posting, source=args.source),
+                    )
+                    print(f"Tracked as #{application.id}")
+
+            elif args.command == "score":
+                application = repo.get_application(session, args.application_id)
+                posting_text = application.description or (
+                    f"{application.role} at {application.company}"
+                )
+                assessment = assess_fit(posting_text, _read_file(args.profile))
+                application.fit_score = assessment.score
+                print(assessment.model_dump_json(indent=2))
+
+    except (
+        repo.ApplicationNotFoundError,
+        repo.InvalidStageTransition,
+        AiNotConfiguredError,
+        AiRequestError,
+        ValueError,
+        OSError,
+    ) as error:
         print(f"applytrack: {error}", file=sys.stderr)
         return EXIT_ERROR
 

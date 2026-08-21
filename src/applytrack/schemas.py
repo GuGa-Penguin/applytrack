@@ -103,3 +103,17 @@ class FunnelStats(BaseModel):
     response_rate: float = Field(
         description="Share of applied roles that reached screen or beyond."
     )
+
+
+class PostingParseRequest(BaseModel):
+    """Raw posting text to be parsed by the model."""
+
+    text: str = Field(min_length=1, max_length=MAX_DESCRIPTION_CHARS)
+    source: str | None = Field(default=None, max_length=100)
+    store_description: bool = True
+
+
+class ScoreRequest(BaseModel):
+    """A candidate profile to assess an application against."""
+
+    profile: str = Field(min_length=1, max_length=20_000)

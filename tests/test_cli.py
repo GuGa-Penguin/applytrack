@@ -86,3 +86,65 @@ def test_add_rejects_an_inverted_salary_band(db_url, capsys):
     )
 
     assert exit_code == 1
+
+
+@pytest.fixture()
+def stub_ai(monkeypatch):
+    """Replace the AI calls so the CLI can be exercised without credentials."""
+    from applytrack.ai.schemas import FitAssessment, ParsedPosting, Recommendation
+
+    posting = ParsedPosting(company="Shopify", role="Senior Engineer", salary_min=120000)
+    assessment = FitAssessment(score=77, recommendation=Recommendation.APPLY)
+
+    monkeypatch.setattr("applytrack.cli.parse_posting", lambda text: posting)
+    monkeypatch.setattr(
+        "applytrack.cli.assess_fit", lambda posting_text, profile: assessment
+    )
+    return posting, assessment
+
+
+def test_parse_prints_the_extracted_posting(db_url, tmp_path, capsys, stub_ai):
+    posting_file = tmp_path / "posting.txt"
+    posting_file.write_text("Senior Engineer at Shopify", encoding="utf-8")
+
+    exit_code = run(db_url, "parse", str(posting_file))
+
+    assert exit_code == 0
+    assert '"company": "Shopify"' in capsys.readouterr().out
+
+
+def test_parse_with_save_tracks_the_role(db_url, tmp_path, capsys, stub_ai):
+    posting_file = tmp_path / "posting.txt"
+    posting_file.write_text("Senior Engineer at Shopify", encoding="utf-8")
+
+    run(db_url, "parse", str(posting_file), "--save", "--source", "LinkedIn")
+
+    assert "Tracked as #1" in capsys.readouterr().out
+
+
+def test_parse_reports_a_missing_file(db_url, capsys, stub_ai):
+    exit_code = run(db_url, "parse", "does-not-exist.txt")
+
+    assert exit_code == 1
+    assert "applytrack:" in capsys.readouterr().err
+
+
+def test_score_prints_the_assessment(db_url, tmp_path, capsys, stub_ai):
+    profile = tmp_path / "profile.txt"
+    profile.write_text("Six years of C#", encoding="utf-8")
+    run(db_url, "add", "Acme", "Engineer")
+    capsys.readouterr()
+
+    exit_code = run(db_url, "score", "1", "--profile", str(profile))
+
+    assert exit_code == 0
+    assert '"score": 77' in capsys.readouterr().out
+
+
+def test_score_reports_an_unknown_application(db_url, tmp_path, capsys, stub_ai):
+    profile = tmp_path / "profile.txt"
+    profile.write_text("Six years of C#", encoding="utf-8")
+
+    exit_code = run(db_url, "score", "99", "--profile", str(profile))
+
+    assert exit_code == 1
