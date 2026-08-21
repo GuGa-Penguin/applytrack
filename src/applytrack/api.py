@@ -4,17 +4,30 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 
-from fastapi import Depends, FastAPI, HTTPException, Query, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
+from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
 from . import repository as repo
 from .db import build_session_factory, create_db_engine
 from .models import Stage
+from .ai import (
+    AiNotConfiguredError,
+    AiRequestError,
+    FitAssessment,
+    ParsedPosting,
+    assess_fit,
+    build_client,
+    parse_posting,
+    to_application,
+)
 from .schemas import (
     ApplicationCreate,
     ApplicationRead,
     ApplicationUpdate,
     FunnelStats,
+    PostingParseRequest,
+    ScoreRequest,
     StageChange,
 )
 
@@ -119,6 +132,79 @@ def create_app(database_url: str | None = None) -> FastAPI:
     @app.get("/stats", response_model=FunnelStats)
     def stats(session: Session = Depends(get_session)):
         return repo.funnel_stats(session)
+
+    @app.exception_handler(AiNotConfiguredError)
+    def ai_not_configured(request: Request, exc: AiNotConfiguredError) -> JSONResponse:
+        """Missing credentials is a configuration problem, not a request error."""
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, content={"detail": str(exc)}
+        )
+
+    def get_ai_client():
+        """Resolve the Anthropic client. Overridden in tests."""
+        return build_client()
+
+    # Exposed so tests can swap in a stub via app.dependency_overrides.
+    app.state.ai_dependency = get_ai_client
+
+    @app.post("/postings/parse", response_model=ParsedPosting)
+    def parse_posting_route(
+        payload: PostingParseRequest, ai_client=Depends(get_ai_client)
+    ):
+        try:
+            return parse_posting(payload.text, client=ai_client)
+        except AiRequestError as error:
+            raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(error)) from error
+        except ValueError as error:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY, str(error)
+            ) from error
+
+    @app.post(
+        "/postings/import",
+        response_model=ApplicationRead,
+        status_code=status.HTTP_201_CREATED,
+    )
+    def import_posting(
+        payload: PostingParseRequest,
+        session: Session = Depends(get_session),
+        ai_client=Depends(get_ai_client),
+    ):
+        try:
+            posting = parse_posting(payload.text, client=ai_client)
+        except AiRequestError as error:
+            raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(error)) from error
+
+        draft = to_application(
+            posting,
+            description=payload.text if payload.store_description else None,
+            source=payload.source,
+        )
+        return repo.create_application(session, draft)
+
+    @app.post("/applications/{application_id}/score", response_model=FitAssessment)
+    def score_application(
+        application_id: int,
+        payload: ScoreRequest,
+        session: Session = Depends(get_session),
+        ai_client=Depends(get_ai_client),
+    ):
+        try:
+            application = repo.get_application(session, application_id)
+        except repo.ApplicationNotFoundError as error:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, str(error)) from error
+
+        posting_text = application.description or (
+            f"{application.role} at {application.company}"
+        )
+        try:
+            assessment = assess_fit(posting_text, payload.profile, client=ai_client)
+        except AiRequestError as error:
+            raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(error)) from error
+
+        application.fit_score = assessment.score
+        session.flush()
+        return assessment
 
     return app
 
